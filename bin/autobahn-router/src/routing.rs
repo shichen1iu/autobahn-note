@@ -28,16 +28,51 @@ pub enum RoutingError {
 }
 
 fn best_price_paths_depth_search<F>(
-    input_node: MintNodeIndex,
+    input_node: MintNodeIndex, //搜索的起始点(如:USDC)
     amount: u64,
-    max_path_length: usize,
-    max_accounts: usize,
+    max_path_length: usize, //一条路径中允许的最大“跳数”或交易次数（例如，4跳）。这可以防止搜索无限进行下去，并使路径保持相对简单
+    max_accounts: usize,    //允许的accounts最大数
+    //当前整个图的数据结构
+    //out_edges_per_node是一个二维数组!!!
+    //这里的T就是Vec<EdgeWithNodes>
+    //out_edges_per_node就是一个邻接表
+    //第一层(索引层)代表图的一个顶点,也就是一条边
+    //第二层是Vec<EdgeWithNodes>代表他的每一条边(out的意思是只包含从当前节点指向其他节点的边)
     out_edges_per_node: &MintVec<Vec<EdgeWithNodes>>,
-    // caller must provide this complying the size rules (see below)
+
+    // 背景: 这种寻路函数在交易聚合器中会被极度频繁地调用。如果在每次调用时都在函数内部创建巨
+    //       大的数据结构来存储中间结果和最终结果，那么内存分配和释放的开销会成为严重的性能瓶颈。
+    // 解决方案: 函数要求调用者预先分配 (pre-allocate) 好内存，然后通过可变引用 &mut 传入。
+    //          函数在这些已经存在的内存上进行读写，实现了“零分配”或近乎“零分配”的执行，这对于热点路径代码至关重要。
+    //第71行和第76行的 assert! 检查就是为了确保这些缓冲区的大小是正确的。
+
+    // 这是一个预先分配好内存的、用来按节点存放最佳路径的数据结构
+    // 这里和out_edges_per_node不同的地方组要是最内层的结构(NotNan<f64>, Vec<EdgeWithNodes>)
+    // 他多了一个NotNan<f64>,代表着路径的最终价值/权重/兑换率。比如，从 A 到 D 的
+    // 一条路径，最终能将 1 个 A 兑换成 1.05 个 D，这个 f64 就可能是 1.05
+    // Vec<EdgeWithNodes>: 得到这个最终价值所需要经过的具体路径，也就是一个边的有序列表。比如 [A->B的边, B->C的边, C->D的边]。
+    // 这里装的是从起始节点到目标节点的最佳路径
+    // 起始节点: input_node (比如 USDC)
+    // 目标节点: best_paths_by_node_prealloc 的索引 (比如 USDT、SOL、DAI 等)
     best_paths_by_node_prealloc: &mut MintVec<Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>>,
-    // caller must provide this complying the size rules (see below)
+
+    // 这是一个预分配的、可变的、以节点为索引的数组，用于在寻路算法
+    // （比如贝尔曼-福特或 Dijkstra 算法的变种）执行期间，实时记录到达每个节点的前 3 条最优路径的收益
+    // 这个包含 3 个浮点数的数组，存储的是从起始节点(入参的input_node)最佳路径的最终收益额。
+    // 比如，它可能存储着 [1.05, 1.02, 1.01]，代表到达这个节点最好的三条路径分别能让初始资金翻 1.05 倍、1.02 倍和 1.01 倍
+    // 同样:他和best_paths_by_node_prealloc一样
+    // 起始节点: input_node (比如 USDC)
+    // 目标节点: best_paths_by_node_prealloc 的索引 (比如 USDT、SOL、DAI 等)
     best_by_node_prealloc: &mut Vec<BestVec3>,
 
+    // best_paths_by_node_prealloc和best_by_node_prealloc的区别
+    // best_by_node_prealloc (当前这个): 存储的是中间状态。它只关心从初始节点到达某个节点的收益数字 (f64)，
+    // 不关心具体是怎么走过来的。这使得算法在迭代时可以快速比较收益值，决定下一步要探索哪个节点。它更轻量，用于算法的核心循环。
+    // best_paths_by_node_prealloc (上一个): 存储的是最终结果。它不仅包含收益 (f64)，还包含了完整的路径 (Vec<EdgeWithNodes>)。
+    // 它更重量级，是在找到一条更好的路径后，用来记录完整解的地方。
+
+    //这是一个函数（技术上讲是闭包），用于计算单次交易的结果。它作为参数被传递进来，
+    //这使得搜索算法本身变得非常通用，并与 ExactIn 和 ExactOut 的具体定价逻辑解耦
     edge_price: F,
     hot_mints: &HashSet<MintNodeIndex>,
     avoid_cold_mints: bool,
@@ -48,6 +83,7 @@ where
 {
     debug!(input_node = input_node.idx_raw(), amount, "finding path");
 
+    //强制max_accounts不超过40
     let max_accounts = max_accounts.min(40);
 
     if tracing::event_enabled!(Level::TRACE) {
@@ -59,15 +95,23 @@ where
         );
     };
 
+    // 寻路算法（如我们之前讨论的）会填满 best_by_node_prealloc 和 best_paths_by_node_prealloc
+    // 这两个“记分板”和“日志”。此时，我们已经知道了到达每个终点的最佳收益，以及到达每个中间节点的前驱节点是什么。
+    // 当算法需要将一条最优路径（比如从A到D的最佳路径）构造成一个明确的、有序的边列表时，它就会使用这个 path 变量。
+    // 回溯构建路径: 当算法需要将一条最优路径（比如从A到D的最佳路径）构造成一个明确的、有序的边列表时，它就会使用这个 path 变量。
+    // 它会从终点 D 开始。
+    // 找到到达 D 的最佳路径是从哪个前驱节点 C 来的，然后把 C -> D 这条边加入到 path 中。
+    // 接着，它跳到节点 C，看它是从哪个前驱节点 B 来的，然后把 B -> C 这条边加入到 path 中。
+    // 如此反复，直到回溯到起点 A。
+    // 此时，path 中可能存储着 [C->D, B->C, A->B]。
+    // 反转和使用: 因为是倒着回溯的，所以需要将 path 反转（reverse）才能得到正确的顺序：[A->B, B->C, C->D]。然后就可以把这条构建好的路径存到最终的结果里，或者直接返回。
+    // 清空和复用: 在为下一条路径进行回溯构建之前，这个 path 会被清空 (path.clear())，而不是重新分配内存。这样，在同一个函数调用中，它可以被反复用来构建多条不同的路径，从而避免了不必要的内存分配，这也是一种性能优化。
     let mut path = Vec::new();
 
-    // mints -> best_paths -> edges; best_paths are some 64; edges are some 4
     let mut best_paths_by_node: &mut MintVec<Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>> =
         best_paths_by_node_prealloc;
 
-    // Best amount received for token/account_size
-    // 3 = number of path kept
-    // 8 = (64/8) (max accounts/bucket_size)
+        //这里说明
     assert_eq!(
         best_by_node_prealloc.len(),
         8 * out_edges_per_node.len(),
@@ -77,14 +121,16 @@ where
         best_by_node_prealloc.iter().all(|v| v.len() == 3),
         "best_by_node_prealloc vector items length error"
     );
+
     let mut best_by_node = best_by_node_prealloc;
 
     let mut stats = vec![0; 2];
 
-    // initialize best_paths_by_node and best_by_node using direct path
+    // 使用直接路径初始化 best_paths_by_node 和 best_by_node
     {
         let current_account_count = 0;
         let in_amount = amount as f64;
+        //这里的out_edge就是当前输入节点的每条边
         for out_edge in &out_edges_per_node[input_node] {
             try_append_to_best_results(
                 &mut best_paths_by_node,
@@ -101,7 +147,7 @@ where
         }
     }
 
-    // Depth first search
+    // 深度优先搜索
     walk(
         &mut best_paths_by_node,
         &mut path,
@@ -125,7 +171,7 @@ where
             best_paths
                 .into_iter()
                 .filter_map(|(out, edges)| {
-                    // did not manage to .iter_into()
+                    // 没能成功 .iter_into()
                     let edges = edges.clone();
                     match swap_mode {
                         SwapMode::ExactIn => {
@@ -152,7 +198,7 @@ where
 fn walk<F2>(
     best_paths_by_node: &mut MintVec<Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>>,
     path: &mut Vec<EdgeWithNodes>,
-    // indexed by "bucket" which is neither Node nor Edge Index
+    // 按 "bucket" 索引，既不是节点索引也不是边索引
     best_by_node: &mut Vec<BestVec3>,
     stats: &mut Vec<u64>,
     in_amount: f64,
@@ -179,7 +225,7 @@ fn walk<F2>(
     stats[0] += 1;
 
     for out_edge in &out_edges_per_node[input_node] {
-        // no cycles
+        // 禁止循环
         if path
             .iter()
             .any(|step| step.source_node == out_edge.target_node)
@@ -202,7 +248,7 @@ fn walk<F2>(
             continue;
         };
 
-        // Stop depth search when encountering a cold mint
+        // 遇到冷门 mint 时停止深度搜索
         if avoid_cold_mints && hot_mints.len() > 0 && !hot_mints.contains(&out_edge.source_node) {
             stats[1] += 1;
             continue;
@@ -227,10 +273,12 @@ fn walk<F2>(
             swap_mode,
         );
 
+        //dfs的回溯
         path.pop();
     }
 }
 
+//当算法考虑走一条特定的边时，计算结果并决定是否要更新我们的最佳路径记录
 fn try_append_to_best_results<F2>(
     best_paths_by_node: &mut MintVec<Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>>,
     path: &Vec<EdgeWithNodes>,
@@ -246,16 +294,24 @@ fn try_append_to_best_results<F2>(
 where
     F2: Fn(EdgeIndex, u64) -> Option<EdgeInfo>,
 {
+    //调用传入的定价函数 edge_price_fn，询问："如果我用 in_amount 的代币去走 out_edge 这条边，能得到什么结果？"
+    // 如果这条边无效（比如流动性不足、池子关闭等），定价函数会返回 None，函数直接退出。
+    // 如果有效，会返回 EdgeInfo，包含了兑换比率 (price) 和需要的账户数 (accounts)。
     let Some(edge_info) = edge_price_fn(out_edge.edge, in_amount as u64) else {
         return None;
     };
+    // 检查账户数约束。Solana 交易有账户数上限，如果走这条边会导致总账户数超过 max_accounts，就放弃这条路径。
     if current_account_count + edge_info.accounts > max_accounts {
         return None;
     }
 
+    // 计算走这条边后能得到的输出金额：输入金额 × 兑换比率 = 输出金额
     let out_amount = in_amount * edge_info.price;
 
+    //从 best_paths_by_node 中取出到达目标节点 (out_edge.target_node) 的最佳路径列表。这个列表按收益排序，存储着到达该节点的前 N 条最优路径
     let best_paths = &mut best_paths_by_node[out_edge.target_node];
+
+    // 拿到从初始节点到out_edge.target_node的所有路径中，收益最差的那条路径的收益值
     let worst = best_paths
         .last()
         .map(|(p, _)| p.into_inner())
@@ -265,8 +321,14 @@ where
         });
 
     if (swap_mode == SwapMode::ExactOut && out_amount < worst)
+    //用户指定了确切的输入数量
+    //要最大化输出收益
         || (swap_mode == SwapMode::ExactIn && out_amount > worst)
     {
+        // 如果条件满足（新路径更好），就调用 replace_worst_path 函数：
+        // 把最差的那条路径从列表中移除
+        // 把当前这条新的更好的路径加入列表
+        // 重新排序，维持"最佳路径列表"的有序性
         replace_worst_path(path, out_edge, out_amount, best_paths, swap_mode);
     }
 
@@ -299,7 +361,7 @@ fn replace_worst_path(
     best_paths: &mut Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>,
     swap_mode: SwapMode,
 ) {
-    // TODO bad for perf - try to find a better solution than this
+    // TODO 性能不佳 - 尝试寻找比这更好的解决方案
     let already_exists = path_already_in(current_path, added_hop, out_amount, best_paths);
 
     if !already_exists {
@@ -364,12 +426,15 @@ struct PathDiscoveryCacheEntry {
     edges: Vec<Vec<EdgeIndex>>,
 }
 
+// 实现了路径缓存的逻辑
 struct PathDiscoveryCache {
+    // 一个哈希表，存储着从A代币到B代币的已发现路径
     cache: HashMap<(MintNodeIndex, MintNodeIndex, SwapMode), Vec<PathDiscoveryCacheEntry>>,
     last_expire_timestamp_millis: u64,
     max_age_millis: u64,
 }
 
+// 提供对缓存的增、查、删（失效）等操作
 impl PathDiscoveryCache {
     fn expire_old(&mut self) {
         let now = millis_since_epoch();
@@ -402,7 +467,7 @@ impl PathDiscoveryCache {
         timestamp_millis: u64,
         mut edges: Vec<Vec<EdgeIndex>>,
     ) {
-        // some 3-4
+        // 大约 3-4
         trace!(
             "insert entry into discovery cache with edges cardinality of {}",
             edges.len()
@@ -411,7 +476,7 @@ impl PathDiscoveryCache {
         let max_accounts_bucket = Self::compute_account_bucket(max_accounts);
         let entry = self.cache.entry((from, to, swap_mode)).or_default();
 
-        // try to reduce memory footprint...
+        // 尝试减少内存占用...
         for path in &mut edges {
             path.shrink_to_fit();
         }
@@ -430,7 +495,7 @@ impl PathDiscoveryCache {
             })
             .unwrap_or_else(|e| e);
 
-        // Replace if it already exists (instead of doubling cache size with old and new path)
+        // 如果已存在则替换（而不是因为旧路径和新路径使缓存大小加倍）
         if pos < entry.len()
             && entry[pos].max_account == max_accounts_bucket
             && entry[pos].in_amount.round() as u64 == in_amount
@@ -453,7 +518,7 @@ impl PathDiscoveryCache {
         let in_amount = in_amount as f64;
         let max_accounts_bucket = Self::compute_account_bucket(max_accounts);
         let Some(entries) = self.cache.get_mut(&(from, to, swap_mode)) else {
-            // cache miss
+            // 缓存未命中
             metrics::PATH_DISCOVERY_CACHE_MISSES.inc();
             return (None, None);
         };
@@ -500,28 +565,28 @@ impl PathDiscoveryCache {
 /// global singleton to manage routing
 #[allow(dead_code)]
 pub struct Routing {
-    // indexed by EdgeIndex
+    // 按 EdgeIndex 索引
     edges: Vec<Arc<Edge>>,
 
-    // indexed by MintNodeIndex
+    // 按 MintNodeIndex 索引
     mints: MintVec<Pubkey>,
 
-    // memory pools for best_price_paths_depth_search
+    // 用于 best_price_paths_depth_search 的内存池
     objectpools: RoutingObjectPools,
 
-    // Preparation for pathfinding
+    // 寻路准备
     // mint pubkey -> NodeIndex
     mint_to_index: HashMap<Pubkey, MintNodeIndex>,
 
     path_discovery_cache: RwLock<PathDiscoveryCache>,
 
-    // Keep pruned edges for a while (speed up searching)
-    // first for exact in and second of exact out
+    // 保留修剪后的边一段时间（加速搜索）
+    // 第一个用于 exact in，第二个用于 exact out
     pruned_out_edges_per_mint_index_exact_in: RwLock<(Instant, MintVec<Vec<EdgeWithNodes>>)>,
     pruned_out_edges_per_mint_index_exact_out: RwLock<(Instant, MintVec<Vec<EdgeWithNodes>>)>,
     path_warming_amounts: Vec<u64>,
 
-    // Optim & Heuristics
+    // 优化和启发式算法
     overquote: f64,
     max_path_length: usize,
     retain_path_count: usize,
@@ -583,7 +648,7 @@ impl Routing {
         }
     }
 
-    /// This should never do anything if path_warming is enabled
+    /// 如果启用了路径预热，这里应该什么都不做
     pub fn prepare_pruned_edges_if_not_initialized(
         &self,
         hot_mints: &HashSet<Pubkey>,
@@ -607,7 +672,7 @@ impl Routing {
         }
     }
 
-    // called per request of criteria match
+    // 根据条件匹配每个请求调用
     #[tracing::instrument(skip_all, level = "trace")]
     pub fn prepare_pruned_edges_and_cleanup_cache(
         &self,
@@ -669,8 +734,8 @@ impl Routing {
                 "weird thing happening"
             );
 
-            // Weird, price for bigger amount should be less good than for small amount
-            // But it can happen with openbook because of the lot size
+            // 奇怪，大额交易的价格应该比小额的差
+            // 但在 openbook 上因为 lot size 的原因可能会发生这种情况
             Some(last / first - 1.0)
         } else {
             Some(first / last - 1.0)
@@ -688,7 +753,7 @@ impl Routing {
     ) -> (i32, MintVec<Vec<EdgeWithNodes>>) {
         let mut result = HashSet::new();
 
-        // best for exact in theoritically should also be best for exact out
+        // 理论上，对于 exact in 最好的，对于 exact out 也应该是最好的
         for (i, _amount) in path_warming_amounts.iter().enumerate() {
             let mut best = HashMap::<(Pubkey, Pubkey), Vec<(EdgeIndex, f64)>>::new();
 
@@ -748,7 +813,7 @@ impl Routing {
         }
 
         let mut valid_edge_count = 0;
-        // TODO how to reuse that? mabye objectpool
+        // TODO 如何重用？或许可以用对象池
         let mut out_edges_per_mint_index: MintVec<Vec<EdgeWithNodes>> =
             MintVec::new_from_prototype(mint_to_index.len(), vec![]);
         let mut lower_price_impact_edge_for_mint_and_direction =
@@ -856,7 +921,7 @@ impl Routing {
 
     fn update_lowest_price_impact(
         lower_price_impact_edge_for_mint_and_direction: &mut HashMap<
-            (MintNodeIndex, bool), // (mint index, is mint 'input' mint for edge)
+            (MintNodeIndex, bool), // (mint 索引, 该 mint 是否为边的'输入' mint)
             (f64, EdgeIndex),
         >,
         edge_index: EdgeIndex,
@@ -875,7 +940,7 @@ impl Routing {
         }
     }
 
-    // called per request
+    // 每个请求调用一次
     #[tracing::instrument(skip_all, level = "trace")]
     fn lookup_edge_index_paths<'a>(
         &self,
@@ -934,8 +999,8 @@ impl Routing {
     where
         F: Fn(&Pubkey, &Pubkey) -> bool,
     {
-        // signer + autobahn-executor program + token program + source token account (others are part of the edges)
-        // + ATA program + system program + mint
+        // 签名者 + autobahn-executor程序 + token程序 + 源代币账户（其他的在交易边里）
+        // + ATA程序 + 系统程序 + mint
         let min_accounts_needed = 7;
 
         let Some(&input_index) = self.mint_to_index.get(input_mint) else {
@@ -1028,7 +1093,7 @@ impl Routing {
         path: &[Arc<Edge>],
         amount: u64,
         add_cooldown: bool,
-    ) -> anyhow::Result<Option<(u64, u64)>> /* (quote price, cached price) */ {
+    ) -> anyhow::Result<Option<(u64, u64)>> /* (报价, 缓存价) */ {
         let mut current_in_amount = amount;
         let mut current_in_amount_dumb = amount;
         let prepare = Self::prepare;
@@ -1119,7 +1184,7 @@ impl Routing {
         path: &[Arc<Edge>],
         amount: u64,
         add_cooldown: bool,
-    ) -> anyhow::Result<Option<(u64, u64)>> /* (quote price, cached price) */ {
+    ) -> anyhow::Result<Option<(u64, u64)>> /* (报价, 缓存价) */ {
         let prepare = Self::prepare;
 
         let mut current_out_amount = amount;
@@ -1208,6 +1273,7 @@ impl Routing {
         Ok(Some((current_out_amount, current_out_amount_dumb)))
     }
 
+    // 接收输入代币、输出代币、交易金额等参数
     pub fn find_best_route(
         &self,
         chain_data: &AccountProviderView,
@@ -1220,25 +1286,32 @@ impl Routing {
         max_path_length: Option<usize>,
         swap_mode: SwapMode,
     ) -> anyhow::Result<Route> {
+        //这是数据预处理。autobahn 会连接很多交易池，但不是所有都有效。这行代码的作用是确保那些无效的、
+        // 或者流动性极差的交易池已经被“修剪”掉了，只留下一批有价值的交易池用于后续的路径搜索。这能极大减少计算量。
         self.prepare_pruned_edges_if_not_initialized(hot_mints, swap_mode);
 
-        // First try with one less hop that maximal authorized as it's way quicker (20-30%)
-        // If we can't find anything, will retry with +1
+        // 首先尝试使用比最大授权跳数少一跳的路径，因为这样会快很多（20-30%）
+        // 如果找不到任何路径，会增加一跳再试一次
+        // 设置路径长度 (max_path_length): 这里有一个重要的性能优化。它不会立即使用配置中允许的最大路径长度（比如4跳），
+        // 而是先用一个更短的长度（比如3跳）来尝试。因为短路径的搜索空间小得多，计算速度会快很多。如果用短路径找不到，后续才有机会用长路径重试。
         let max_path_length = max_path_length.unwrap_or((self.max_path_length - 1).max(1));
 
-        // overestimate requested `in_amount` so that quote is not too tight for exact in,
-        // exact out we do not overquote here but we will overquote when route is built
+        //高估输入金额 (overquote): 为了防止因为滑点等问题导致最终交易失败，代码会故意将请求的交易金额稍微上浮一点（比如 +20%）。
+        //它用这个高估的金额去寻找路径，确保找到的路径有足够的“缓冲”，能成功执行实际金额的交易。
         let amount = (original_amount as f64 * (1.0 + self.overquote)).round() as u64;
 
-        // signer + autobahn-executor program + token program + source token account (others are part of the edges)
-        // + ATA program + system program + mint
+        // 签名者 + autobahn-executor程序 + token程序 + 源代币账户（其他的在交易边里）
+        // + ATA程序 + 系统程序 + mint
         let min_accounts_needed = 7;
 
-        // Multiple steps:
-        // 1. Path discovery: which paths are plausibly good? (expensive, should be cached)
-        // 2. Path evaluation/optimization: do actual path quoting, try to find a multi-path route
-        // 3. Output generation
+        // 主要步骤:
+        // 1. 路径发现：哪些路径可能是比较好的？（这个过程开销大，应该被缓存）
+        // 2. 路径评估/优化：进行实际的路径报价，尝试寻找多路径路由
+        // 3. 生成输出
 
+        // 在算法内部，直接使用长长的 Pubkey 地址进行计算效率很低。所以项目在初始化时，
+        // 会给每个代币地址（Pubkey）分配一个独一无二的、从0开始的数字ID（MintNodeIndex）。
+        // 这两行代码就是把用户传进来的 input_mint 和 output_mint 地址，转换成内部使用的数字ID，即 input_index 和 output_index。
         let Some(&input_index) = self.mint_to_index.get(input_mint) else {
             bail!(RoutingError::UnsupportedInputMint(input_mint.clone()));
         };
@@ -1253,12 +1326,16 @@ impl Routing {
             "find_best_route"
         );
 
-        // Path discovery: find candidate paths for the pair.
-        // Prefer cached paths where possible.
+        // 路径发现：为交易对寻找候选路径。
+        // 尽可能优先使用缓存中的路径。
+        // 这是函数最核心的部分，目的是找到从起点到终点的所有“候选路径”。
         let cached_paths_opt = {
+            //首先尝试从缓存里拿结果。路径搜索非常耗时，所以系统会将每次的搜索结果缓存起来。
             let mut cache = self.path_discovery_cache.write().unwrap();
+            //检查缓存里有没有从input_index到output_index，在当前金额amount和账户数max_accounts限制下的记录。
             let cached = cache.get(input_index, output_index, swap_mode, amount, max_accounts);
 
+            //self.lookup_edge_index_paths(...): 如果缓存里有，缓存存的只是路径的ID序列。这两行代码把ID序列转换回完整的路径数据。
             let p1 = cached
                 .0
                 .map(|paths| self.lookup_edge_index_paths(paths.iter()));
@@ -1266,6 +1343,7 @@ impl Routing {
                 .1
                 .map(|paths| self.lookup_edge_index_paths(paths.iter()));
 
+            //如果调用者强制要求ignore_cache，或者缓存里确实什么都没有，那么cached_paths_opt就会是 None。否则，它会包含所有从缓存中读出的路径。
             if (p1.is_none() && p2.is_none()) || ignore_cache {
                 None
             } else {
@@ -1293,6 +1371,8 @@ impl Routing {
 
         let mut paths;
         let mut used_cached_paths = false;
+        // 如果缓存里有路径 (if let Some(...))，就直接用缓存的路径。如果缓存里没有 (else)，就启动一次全新的、实时的搜索。
+
         if let Some(cached_paths) = cached_paths_opt {
             paths = cached_paths;
             used_cached_paths = true;
@@ -1306,6 +1386,8 @@ impl Routing {
 
             let (out_paths, new_paths_by_out_node) = match swap_mode {
                 SwapMode::ExactIn => {
+                    // 这是真正启动搜索的地方。它会调用底层的深度优先搜索算法，在所有（经过修剪的）交易池网络里，
+                    // 从input_index开始，查找所有能在max_path_length步内到达其他所有节点的路径
                     let new_paths_by_out_node = self.generate_best_paths(
                         amount,
                         timestamp,
@@ -1318,6 +1400,8 @@ impl Routing {
                         max_path_length,
                     )?;
                     (
+                        // generate_best_paths 返回的是从起点到所有节点的路径。这一小段代码是从这批海量的结果中，
+                        // 只把那些终点恰好是我们想要的output_index的路径筛选出来，存入out_paths
                         self.lookup_edge_index_paths(new_paths_by_out_node[output_index].iter()),
                         new_paths_by_out_node,
                     )
@@ -1340,10 +1424,16 @@ impl Routing {
                     )
                 }
             };
+
+            //路径评估 - 计算每条路径的真实价格 (1365-1395行)
+
+            //现在，变量paths里装着所有候选路径。但这些路径在搜索时用的是预估价格，不一定准。这一步就是要对它们进行精确的计算和排序。
             paths = out_paths;
 
             for (out_index, new_paths) in new_paths_by_out_node.into_iter().enumerate() {
                 let out_index: MintNodeIndex = out_index.into();
+                // self.add_direct_paths(...): 这是一个保险措施。它会把所有从起点到终点的“单跳”路径
+                //（即只经过一个交易池的路径）也手动加到paths列表里，确保最简单的路径不会被遗漏
                 self.path_discovery_cache.write().unwrap().insert(
                     input_index,
                     out_index,
@@ -1356,24 +1446,27 @@ impl Routing {
             }
         }
 
-        // Path discovery: add all direct paths
-        // note: currently this could mean some path exist twice
+        // 路径发现：添加所有直接路径
+        // 注意：目前这可能意味着某些路径会存在两次
         self.add_direct_paths(input_index, output_index, out_edges_per_node, &mut paths);
 
-        // Do not keep that locked - deadlock with recursion and also may impact performance
+        // 不要保持锁定状态——这会导致递归死锁，并且会影响性能
         drop(pruned);
 
-        // Path evaluation
-        // TODO: this could evaluate pairs of paths to see if a split makes sense,
-        // needs to take care of shared steps though.
+        // 路径评估
+        // TODO: 这里可以评估路径对，看是否进行拆分交易更有意义，
+        // 不过需要处理好共享步骤的问题。
 
         let mut snapshot = HashMap::new();
 
+        // 这个函数（compute_out_amount_from_path 或 compute_in_amount_from_path）会模拟这笔交易，
+        // 考虑所有真实的手续费、滑点等因素，计算出这条路径最终能得到的精确兑换数量
         let path_output_fn = match swap_mode {
             SwapMode::ExactIn => Self::compute_out_amount_from_path,
             SwapMode::ExactOut => Self::compute_in_amount_from_path,
         };
 
+        //最终，path_and_output变量里会存储一个列表，每个元素是 (路径, 真实兑换数量, 预估兑换数量)
         let mut path_and_output = paths
             .into_iter()
             .filter_map(|path| {
@@ -1385,12 +1478,15 @@ impl Routing {
             })
             .collect_vec();
 
+        //根据上一步计算出的真实兑换数量，对所有路径进行排序。
+        // 买入时，按能收到的out_amount从高到低排；
+        // 卖出时，按需要付出的in_amount从低到高排。这样，列表的第一条路径，就是理论上的“最佳路径”。
         match swap_mode {
             SwapMode::ExactIn => path_and_output.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v)),
             SwapMode::ExactOut => path_and_output.sort_by_key(|(_, v, _)| *v),
         }
 
-        // Debug
+        // 调试
         if tracing::event_enabled!(Level::TRACE) {
             for (path, out_amount, out_amount_dumb) in &path_and_output {
                 trace!(
@@ -1402,11 +1498,15 @@ impl Routing {
             }
         }
 
-        // Build the output
+        //第4部分：构建最终路由并返回 (1411-1517行)
+        // 现在我们有了一个按优劣排好序的路径列表。这一步就是从最好的那条开始，尝试构建一个可以被执行的、完整的Route对象。
 
+        //从最好的一条路径开始，循环尝试。
         for (out_path, routing_result, _) in path_and_output {
             let (route_steps, context_slot) = match swap_mode {
-                // Restore requested `in_amount` for route building here
+                // 在这里恢复请求的 `in_amount` 用于构建路由
+                //作用: 将抽象的路径信息（比如经过哪几个交易池），转换成具体的交易步骤Vec<RouteStep>。
+                //注意，这里用的是用户原始请求的original_amount，而不是我们之前为了安全垫而高估的amount。
                 SwapMode::ExactIn => Self::build_route_steps(
                     chain_data,
                     &mut snapshot,
@@ -1423,6 +1523,7 @@ impl Routing {
                 )?,
             };
 
+            // 从构建好的route_steps中，提取出经过精确计算后的实际输入和输出数量。
             let actual_in_amount = route_steps.first().unwrap().in_amount;
             let actual_out_amount = route_steps.last().unwrap().out_amount;
 
@@ -1431,6 +1532,9 @@ impl Routing {
                 SwapMode::ExactOut => routing_result,
             };
 
+            // 获取一个“几乎没有价格影响”的基准汇率。
+            // 它调用Self::compute_out_amount_from_path函数，模拟用同样的路径，但只交易一笔极小的金额（1_000个最小单位）。
+            // 因为金额小，所以它几乎不会影响市场价格，得到的汇率可以看作是当前的“即时价”或“公允价”。
             let out_amount_for_small_amount = Self::compute_out_amount_from_path(
                 chain_data,
                 &mut snapshot,
@@ -1441,10 +1545,17 @@ impl Routing {
             .unwrap_or_default()
             .0;
 
+            //let out_amount_for_request = actual_out_amount;
+            //目的: 这只是给变量起一个更清晰的名字，actual_out_amount是您这笔真实金额交易算出来的最终输出数量。
             let out_amount_for_request = actual_out_amount;
+            //计算并比较两种情况下的汇率
+            //expected_ratio: 小额交易的“理想”汇率。
+            //actual_ratio: 您这笔大额交易的“实际”汇率。
             let expected_ratio = 1_000.0 / out_amount_for_small_amount as f64;
             let actual_ratio = actual_in_amount as f64 / actual_out_amount as f64;
 
+            // 通过比较“理想”汇率和“实际”汇率的差异，计算出一个百分比，通常用基点（BPS）表示（100 BPS = 1%）。
+            // 这个price_impact_bps值会包含在最终返回的路由信息里，让用户知道这笔交易的滑点有多大
             let price_impact = expected_ratio / actual_ratio * 10_000.0 - 10_000.0;
             let price_impact_bps = price_impact.round() as u64;
 
@@ -1458,6 +1569,10 @@ impl Routing {
             );
 
             let adjusted_out_amount = match swap_mode {
+                //这段公式 ((actual_in_amount / overquote_in_amount) * routing_result) 看起来复杂，其实是在做线性缩放。
+                //它的逻辑是：“既然我的实际输入金额(actual_in_amount)是高估输入金额(overquote_in_amount)的X倍，那
+                //么我最终得到的输出金额，也应该是高估金额算出来的输出(routing_result)的X倍”。这是一种近似计算，
+                //用于将输出金额调整回与原始输入金额相匹配的水平
                 SwapMode::ExactIn => ((actual_in_amount as f64 / overquote_in_amount as f64)
                     * routing_result as f64)
                     .floor() as u64,
@@ -1476,6 +1591,9 @@ impl Routing {
                 SwapMode::ExactOut => amount,
             };
 
+            //这是一个守卫语句，防止返回无效或无意义的路径
+            //它检查：对于“精确输出”模式，计算出的所需输入金额是不是无穷大（u64::MAX）？对于“精确输入”模式，计算出的最终输出金额是不是0？
+            //如果出现这些情况，说明这条路径实际上是走不通的。continue;语句会跳过这条路径，继续尝试候选列表中的下一条。
             if (swap_mode == SwapMode::ExactOut
                 && (actual_in_amount == u64::MAX || actual_out_amount == 0))
                 || (swap_mode == SwapMode::ExactIn && adjusted_out_amount == 0)
@@ -1496,10 +1614,15 @@ impl Routing {
 
             // If enabled,for debug purpose, recompute route while capturing accessed chain accounts
             // Can be used when executing the swap to check if accounts have changed
+            // 目的: 这是一个可选的调试和安全功能。如果启用了某个编译特性（capture-accounts），它会再次模拟交易，并把这条路径上所有涉及到的账户的当前状态（数据和版本号）“快照”并记录下来。
+            // 用途: 在真正执行这笔交易前，可以再次检查这些账户的状态是否和快照时一致。如果有变化，可能意味着价格已经变了，此时可以中止交易，防止用户遭受损失。
             let accounts = self
                 .capture_accounts(chain_data, &out_path, original_amount)
                 .ok();
 
+            //成功退出点。一旦一条路径通过了以上所有的检查和计算，代码就会在这里创建一个最终的 Route 对象，
+            // 打包所有信息（输入输出金额、交易步骤、价格影响、账户快照等），然后通过 return Ok(...) 成功返回。
+            // 整个find_best_route函数在此刻就结束了。
             return Ok(Route {
                 input_mint: *input_mint,
                 output_mint: *output_mint,
@@ -1512,6 +1635,13 @@ impl Routing {
             });
         }
 
+        //处理完全失败的情况
+        //即上面的for循环把所有候选路径都试了一遍，但没有一条能够通过检查并成功返回。
+        // 目的: 启动“B计划”，进行最后一次尝试。
+        // 如何做: 它会调用自己，但这次会放宽限制，例如：
+        // 如果之前用了缓存，这次就强制忽略缓存，因为缓存可能已经过时了。
+        // 如果之前没用缓存，说明在当前路径长度限制下找不到，这次就将最大路径长度加一，扩大搜索范围。
+        // 如果这“最后的尝试”成功了，它会返回一个Route。如果连这次都失败了，那程序就真的回天乏术，最终会向上层抛出 NoPathBetweenMintPair 错误。
         // No acceptable path
         self.find_route_with_relaxed_constraints_or_fail(
             &chain_data,
@@ -1622,7 +1752,7 @@ impl Routing {
         }
     }
 
-    // per request then per edge down the path
+    // 每个请求一次，然后是路径中的每个边
     #[tracing::instrument(skip_all, level = "trace")]
     fn build_route_steps(
         chain_data: &AccountProviderView,
@@ -1694,7 +1824,7 @@ impl Routing {
             context_slot = edge_slot.max(context_slot);
         }
 
-        // reverse the steps for exact out
+        // 对于 exact out，反转步骤
         steps.reverse();
 
         Ok((steps, context_slot))
@@ -1726,7 +1856,7 @@ impl Routing {
         }
     }
 
-    // called once per request
+    // 每个请求调用一次
     #[tracing::instrument(skip_all, level = "trace")]
     fn generate_best_paths(
         &self,
@@ -1740,11 +1870,11 @@ impl Routing {
         avoid_cold_mints: bool,
         max_path_length: usize,
     ) -> anyhow::Result<MintVec<Vec<Vec<EdgeIndex>>>> {
-        // non-pooled version
+        // 非池化版本
         // let mut best_by_node_prealloc = vec![vec![0f64; 3]; 8 * out_edges_per_node.len()];
         let mut best_by_node_prealloc = self.objectpools.get_best_by_node(out_edges_per_node.len());
 
-        // non-pooled version
+        // 非池化版本
         // let mut best_paths_by_node_prealloc: MintVec<Vec<(NotNan<f64>, Vec<EdgeWithNodes>)>> =
         //     MintVec::new_from_prototype(
         //         out_edges_per_node.len(),
@@ -1770,7 +1900,7 @@ impl Routing {
 
         let mut best_paths_by_out_node =
             MintVec::new_from_prototype(new_paths_by_out_node.len(), vec![]);
-        // len is some 400000
+        // 长度大约是 400000
         trace!("new_paths_by_out_node len={}", new_paths_by_out_node.len());
 
         for (out_node, best_paths) in new_paths_by_out_node.into_iter().enumerate() {
@@ -1788,7 +1918,7 @@ impl Routing {
         Ok(best_paths_by_out_node)
     }
 
-    // called once per request
+    // 每个请求调用一次
     #[tracing::instrument(skip_all, level = "trace")]
     fn generate_best_paths_exact_out(
         &self,
@@ -1802,7 +1932,7 @@ impl Routing {
         avoid_cold_mints: bool,
         max_path_length: usize,
     ) -> anyhow::Result<MintVec<Vec<Vec<EdgeIndex>>>> {
-        // similar to generate_best_paths justg changing function to calculate edge info and setting is_exact_out to true
+        // 类似于 generate_best_paths，只是改变了计算边信息的函数并将 is_exact_out 设置为 true
         let mut best_by_node_prealloc = self.objectpools.get_best_by_node(out_edges_per_node.len());
 
         let mut best_paths_by_node_prealloc = self

@@ -32,11 +32,12 @@ pub struct Route {
     pub accounts: Option<HashMap<Pubkey, AccountData>>,
 }
 
+//表示一条有向边而设计
 #[derive(Clone)]
 pub(crate) struct EdgeWithNodes {
-    pub(crate) source_node: MintNodeIndex,
-    pub(crate) target_node: MintNodeIndex,
-    pub(crate) edge: EdgeIndex,
+    pub(crate) source_node: MintNodeIndex, //起始节点（代币）的索引
+    pub(crate) target_node: MintNodeIndex, //目标节点（代币）的索引
+    pub(crate) edge: EdgeIndex, //边的索引
 }
 
 #[derive(Clone)]
@@ -99,6 +100,7 @@ impl<T: Clone> From<Vec<T>> for MintVec<T> {
 
 impl<T: Clone> MintVec<T> {
     // clone each element from the prototype
+    // 这里如果prototype:T是一个vec 那么这里的MintVec就是一个二维数组
     pub fn new_from_prototype(size: usize, prototype: T) -> Self {
         trace!("init MintVec of size {}", size);
         MintVec {

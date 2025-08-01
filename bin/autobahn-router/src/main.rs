@@ -132,28 +132,42 @@ async fn main() -> anyhow::Result<()> {
         .or(default_source_config)
         .unwrap_or_else(|| panic!("did not find a source config for region {}", region));
 
+    //创建rpc
     let rpc = build_rpc(&source_config);
     let number_of_accounts_per_gma = source_config.number_of_accounts_per_gma.unwrap_or(100);
 
+    //-----------------------------
     // handle sigint
+    //处理优雅关闭信号（graceful shutdown）
+    //创建一个原子布尔值作为退出标志，用 Arc 包装以便在多个线程间共享
+    // 初始值为 false
     let exit_flag: Arc<atomic::AtomicBool> = Arc::new(atomic::AtomicBool::new(false));
+    //创建一个广播通道，用于向其他组件发送退出信号
     let (exit_sender, _) = broadcast::channel(1);
     {
         let exit_flag = exit_flag.clone();
         let exit_sender = exit_sender.clone();
         tokio::spawn(async move {
+            //在新的异步任务中监听 SIGINT 信号（Ctrl+C）
             tokio::signal::ctrl_c().await.unwrap();
             info!("Received SIGINT, shutting down...");
+            //将退出标志设置为 true
             exit_flag.store(true, atomic::Ordering::Relaxed);
+            // 通过广播通道发送退出信号
             exit_sender.send(()).unwrap();
         });
     }
 
+    //-------------------------
+    //用于传递账户数据或快照更新,无界通道（unbounded）
     let (account_write_sender, account_write_receiver) =
         async_channel::unbounded::<AccountOrSnapshotUpdate>();
+    //用于传递数据源的元数据信息,无界通道
     let (metadata_write_sender, metadata_write_receiver) =
         async_channel::unbounded::<FeedMetadata>();
+    //用于传递 Solana 区块链的插槽（slot）更新信息
     let (slot_sender, slot_receiver) = async_channel::unbounded::<SlotUpdate>();
+    //广播通道，可以向多个接收者同时发送账户更新
     let (account_update_sender, _) = broadcast::channel(4 * 1024 * 1024); // TODO this is huge, but init snapshot will completely spam this
 
     let chain_data = Arc::new(RwLock::new(ChainData::new()));
@@ -165,13 +179,19 @@ async fn main() -> anyhow::Result<()> {
         exit_sender.subscribe(),
     );
 
+    //---------------------
+    //这段代码是元数据中继器（metadata relayer），负责转发和广播元数据更新
+    //创建一个容量为500的广播通道,用于向多个订阅者同时发送元数据更新
     let (metadata_update_sender, _) = broadcast::channel(500);
     let metadata_update_sender_clone = metadata_update_sender.clone();
     let metadata_job = tokio_spawn("metadata_relayer", async move {
         loop {
+            //从接收通道读取元数据
             let msg = metadata_write_receiver.recv().await;
             match msg {
                 Ok(msg) => {
+                    // 从 metadata_write_receiver 接收来自数据源的元数据
+                    // 将元数据通过 metadata_update_sender 广播给所有订阅者
                     if metadata_update_sender_clone.send(msg).is_err() {
                         error!("Failed to write metadata update");
                         break;
@@ -185,6 +205,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    //----------------------
+    // 配置quic和grpc
     if let Some(quic_sources) = &source_config.quic_sources {
         info!(
             "quic sources: {}",
@@ -557,6 +579,7 @@ async fn main() -> anyhow::Result<()> {
     // unreachable
 }
 
+//构建价格数据源（price feed）的工厂函数
 fn build_price_feed(
     config: &Config,
     exit_sender: &broadcast::Sender<()>,
@@ -583,12 +606,13 @@ fn build_blocking_rpc(source_config: &AccountDataSourceConfig) -> BlockingRpcCli
     )
 }
 
+
 fn start_chaindata_updating(
-    chain_data: ChainDataArcRw,
-    account_writes: async_channel::Receiver<AccountOrSnapshotUpdate>,
-    slot_updates: async_channel::Receiver<SlotUpdate>,
-    account_update_sender: broadcast::Sender<(Pubkey, Pubkey, u64)>,
-    mut exit: broadcast::Receiver<()>,
+    chain_data: ChainDataArcRw, //共享的链数据存储
+    account_writes: async_channel::Receiver<AccountOrSnapshotUpdate>, //接收账户更新的通道
+    slot_updates: async_channel::Receiver<SlotUpdate>, //接收插槽更新的通道
+    account_update_sender: broadcast::Sender<(Pubkey, Pubkey, u64)>, //向其他组件广播账户更新
+    mut exit: broadcast::Receiver<()>, //接收退出信号的通道
 ) -> JoinHandle<()> {
     use mango_feeds_connector::chain_data::SlotData;
 
@@ -596,11 +620,14 @@ fn start_chaindata_updating(
         let mut most_recent_seen_slot = 0;
 
         loop {
+            //使用 tokio::select! 同时监听多个事件：
             tokio::select! {
+                //收到退出信号时优雅关闭任务
                 _ = exit.recv() => {
                     info!("shutting down chaindata update task");
                     break;
                 }
+                //这是最复杂的处理分支，包含微批处理优化机制
                 res = account_writes.recv() => {
                     let Ok(update) = res
                     else {
@@ -609,10 +636,12 @@ fn start_chaindata_updating(
                     };
 
                     let mut writer = chain_data.write().unwrap();
+                    // 处理单个账户更新
                     handle_updated_account(&mut most_recent_seen_slot, &mut writer, update, &account_update_sender);
 
                     let mut batchsize: u32 = 0;
                     let started_at = Instant::now();
+                    // 微批处理优化
                     'batch_loop: while let Ok(update) = account_writes.try_recv() {
                         batchsize += 1;
 
@@ -624,6 +653,7 @@ fn start_chaindata_updating(
                         }
                     }
                 }
+                //处理区块链插槽状态变化
                 res = slot_updates.recv() => {
                     let Ok(slot_update) = res
                     else {
